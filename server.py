@@ -164,19 +164,29 @@ def handle_message():
                 "message": "Message cannot be empty"
             }), 400
         
+        # Log incoming message for debugging
+        logger.info(f"Received message: '{user_message}'")
+        logger.info(f"Checking for bot name '{BOT_NAME}' in message...")
+        
         # Process the message
         bot_reply = SmoothBot.process_message(user_message)
         
         # If bot doesn't respond (name not mentioned), return empty reply
         if not bot_reply:
+            logger.info(f"Bot name '{BOT_NAME}' not found in message. Not responding.")
             return jsonify({
                 "reply": "",
+                "responded": False,
                 "note": f"Bot only responds when '{BOT_NAME}' is mentioned in the message"
             }), 200
+        
+        # Log response
+        logger.info(f"Responding with: '{bot_reply[:50]}...'")
         
         # Return bot's reply
         return jsonify({
             "reply": bot_reply,
+            "responded": True,
             "timestamp": datetime.now(IST_TIMEZONE).isoformat()
         }), 200
         
