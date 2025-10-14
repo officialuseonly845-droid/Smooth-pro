@@ -1,9 +1,10 @@
 import os
 import logging
-from datetime import datetime, timedelta
+import json
+from datetime import datetime, timedelta, time
 from telegram import Update
-from telegram.ext import Application, MessageHandler, filters, ContextTypes
-from telegram.constants import ParseMode
+from telegram.ext import Application, MessageHandler, filters, ContextTypes, CommandHandler
+from telegram.constants import ParseMode, ChatType
 import requests
 from threading import Thread
 from flask import Flask
@@ -25,6 +26,7 @@ NEWS_API_KEY = os.getenv('NEWS_API_KEY')
 BOT_NAME = "smooth"
 OPENROUTER_MODEL = "deepseek/deepseek-chat:free"
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+GROUPS_FILE = "groups.json"
 
 # Character persona
 PERSONA = """You are Smooth, a chill and friendly AI assistant with a laid-back personality. 
@@ -41,17 +43,46 @@ def home():
 
 @app.route('/health')
 def health():
-    return {"status": "healthy", "bot": "smooth", "timestamp": datetime.now().isoformat()}
+    return {"status": "healthy", "bot": "smooth", "groups": len(load_groups())}
 
 def run_flask():
     """Run Flask server in a separate thread"""
     port = int(os.getenv('PORT', 8000))
     app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
 
+# Group Management
+def load_groups():
+    """Load saved groups from file"""
+    try:
+        if os.path.exists(GROUPS_FILE):
+            with open(GROUPS_FILE, 'r') as f:
+                return json.load(f)
+        return {}
+    except Exception as e:
+        logger.error(f"Error loading groups: {e}")
+        return {}
+
+def save_groups(groups):
+    """Save groups to file"""
+    try:
+        with open(GROUPS_FILE, 'w') as f:
+            json.dump(groups, f, indent=2)
+    except Exception as e:
+        logger.error(f"Error saving groups: {e}")
+
+def add_group(chat_id, chat_title):
+    """Add a group to the saved list"""
+    groups = load_groups()
+    groups[str(chat_id)] = {
+        "title": chat_title,
+        "added_at": datetime.now().isoformat()
+    }
+    save_groups(groups)
+    logger.info(f"Group added: {chat_title} ({chat_id})")
+
 def call_openrouter(messages, image_url=None):
     """Call OpenRouter API with error handling"""
     try:
-        # Prepare the last message content
         last_message = messages[-1].copy()
         
         if image_url:
@@ -75,7 +106,7 @@ def call_openrouter(messages, image_url=None):
         
         response = requests.post(OPENROUTER_URL, headers=headers, json=data, timeout=30)
         
-        if response.status_code == 429:  # Rate limit
+        if response.status_code == 429:
             logger.warning("OpenRouter rate limit hit")
             return None, True
         
@@ -118,24 +149,23 @@ def format_news_section(title, emoji, articles):
     if articles:
         for i, article in enumerate(articles, 1):
             title_text = article.get('title', 'No title')
-            # Escape markdown special characters
             title_text = title_text.replace('_', '\\_').replace('*', '\\*').replace('[', '\\[').replace('`', '\\`')
             url = article.get('url', '')
             source = article.get('source', {}).get('name', 'Unknown')
             
-            # Truncate title if too long
             if len(title_text) > 100:
                 title_text = title_text[:97] + "..."
             
-            section += f"{i}. *{source}*\n   {title_text}\n   🔗 [Read more]({url})\n\n"
+            section += f"{i}\\. *{source}*\n   {title_text}\n   🔗 [Read more]({url})\n\n"
     else:
         section += "No recent news available 📭\n\n"
     
     return section
 
 def format_news_message():
-    """Format daily news message with emojis"""
-    current_time = datetime.now(pytz.timezone('Asia/Kolkata')).strftime("%B %d, %Y at %I:%M %p IST")
+    """Format news message with emojis"""
+    ist = pytz.timezone('Asia/Kolkata')
+    current_time = datetime.now(ist).strftime("%B %d, %Y at %I:%M %p IST")
     
     message = f"🌅 *GOOD MORNING\\! DAILY NEWS ROUNDUP* 🌅\n"
     message += f"📅 _{current_time}_\n"
@@ -161,45 +191,56 @@ def format_news_message():
     return message
 
 async def send_daily_news(context: ContextTypes.DEFAULT_TYPE):
-    """Send and pin daily news to all groups"""
-    job = context.job
-    chat_id = job.chat_id
+    """Send daily news to all registered groups"""
+    groups = load_groups()
     
-    try:
-        logger.info(f"Preparing to send daily news to chat {chat_id}")
-        news_message = format_news_message()
-        
-        sent_message = await context.bot.send_message(
-            chat_id=chat_id,
-            text=news_message,
-            parse_mode=ParseMode.MARKDOWN_V2,
-            disable_web_page_preview=True
-        )
-        
-        # Try to pin the message
+    if not groups:
+        logger.warning("No groups registered for daily news")
+        return
+    
+    logger.info(f"Sending daily news to {len(groups)} groups")
+    news_message = format_news_message()
+    
+    for chat_id_str, group_info in groups.items():
         try:
-            await context.bot.pin_chat_message(
+            chat_id = int(chat_id_str)
+            sent_message = await context.bot.send_message(
                 chat_id=chat_id,
-                message_id=sent_message.message_id,
-                disable_notification=False
+                text=news_message,
+                parse_mode=ParseMode.MARKDOWN_V2,
+                disable_web_page_preview=True
             )
-            logger.info(f"Daily news sent and pinned to {chat_id}")
-        except Exception as pin_error:
-            logger.warning(f"Could not pin message in {chat_id}: {pin_error}")
-            logger.info(f"Daily news sent (not pinned) to {chat_id}")
             
-    except Exception as e:
-        logger.error(f"Error sending daily news to {chat_id}: {e}")
+            # Try to pin
+            try:
+                await context.bot.pin_chat_message(
+                    chat_id=chat_id,
+                    message_id=sent_message.message_id,
+                    disable_notification=False
+                )
+                logger.info(f"News sent and pinned to {group_info['title']} ({chat_id})")
+            except Exception as pin_error:
+                logger.warning(f"Could not pin in {group_info['title']}: {pin_error}")
+                logger.info(f"News sent (not pinned) to {group_info['title']} ({chat_id})")
+                
+        except Exception as e:
+            logger.error(f"Error sending news to {chat_id_str}: {e}")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle incoming messages"""
     if not update.message:
         return
     
+    chat = update.effective_chat
+    
+    # Track group membership
+    if chat.type in [ChatType.GROUP, ChatType.SUPERGROUP]:
+        add_group(chat.id, chat.title)
+    
     message_text = update.message.text or update.message.caption or ""
     bot_username = context.bot.username
     
-    # Check if bot is mentioned by name "smooth"
+    # Check if bot is mentioned
     is_mentioned = (
         BOT_NAME.lower() in message_text.lower() or
         f"@{bot_username}".lower() in message_text.lower() or
@@ -207,17 +248,36 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
          update.message.reply_to_message.from_user.id == context.bot.id)
     )
     
-    # Don't respond if not mentioned
     if not is_mentioned:
         return
     
     logger.info(f"Bot mentioned by user {update.message.from_user.id}: {message_text[:50]}")
     
+    # Check if user is asking for news
+    news_keywords = ['news', 'headlines', 'updates', 'latest news', 'whats happening', "what's happening"]
+    is_news_request = any(keyword in message_text.lower() for keyword in news_keywords)
+    
+    if is_news_request:
+        await update.message.reply_text("Let me fetch the latest news for you! 🔍📰")
+        
+        try:
+            news_message = format_news_message()
+            await update.message.reply_text(
+                news_message,
+                parse_mode=ParseMode.MARKDOWN_V2,
+                disable_web_page_preview=True
+            )
+            logger.info("News sent successfully")
+        except Exception as e:
+            logger.error(f"Error sending news: {e}")
+            await update.message.reply_text("Oops! Had trouble fetching news 😅 Try again in a moment?")
+        return
+    
     # Handle image
     image_url = None
     if update.message.photo:
         try:
-            photo = update.message.photo[-1]  # Highest resolution
+            photo = update.message.photo[-1]
             file = await context.bot.get_file(photo.file_id)
             image_url = file.file_path
             if not message_text or BOT_NAME.lower() == message_text.lower():
@@ -247,36 +307,41 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("Oops! Something went wrong 😅 Try again?")
 
-def setup_daily_news(application: Application):
-    """Setup daily news job for all configured chats"""
-    ist = pytz.timezone('Asia/Kolkata')
-    
-    # Get group chat IDs from environment
-    group_chat_ids = os.getenv('GROUP_CHAT_IDS', '').split(',')
-    group_chat_ids = [cid.strip() for cid in group_chat_ids if cid.strip()]
-    
-    if not group_chat_ids:
-        logger.warning("No GROUP_CHAT_IDS configured. Daily news will not be sent.")
+async def cmd_groups(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show registered groups (admin command)"""
+    if BOT_NAME.lower() not in update.message.text.lower():
         return
     
-    # Schedule news for each group
-    for chat_id in group_chat_ids:
-        try:
-            application.job_queue.run_daily(
-                send_daily_news,
-                time=datetime.strptime("07:00", "%H:%M").time(),
-                days=(0, 1, 2, 3, 4, 5, 6),  # All days
-                chat_id=chat_id,
-                name=f"daily_news_{chat_id}",
-                job_kwargs={'timezone': ist}
-            )
-            logger.info(f"Daily news scheduled for chat {chat_id} at 7:00 AM IST")
-        except Exception as e:
-            logger.error(f"Error scheduling news for chat {chat_id}: {e}")
+    groups = load_groups()
+    
+    if not groups:
+        await update.message.reply_text("No groups registered yet. Just use me in a group and I'll remember it! 😎")
+        return
+    
+    message = f"📋 *Registered Groups* ({len(groups)}):\n\n"
+    for chat_id, info in groups.items():
+        message += f"• {info['title']}\n  ID: `{chat_id}`\n\n"
+    
+    await update.message.reply_text(message, parse_mode=ParseMode.MARKDOWN)
+
+def setup_daily_news(application: Application):
+    """Setup daily news job"""
+    ist = pytz.timezone('Asia/Kolkata')
+    
+    # Schedule for 7:00 AM IST every day
+    application.job_queue.run_daily(
+        send_daily_news,
+        time=time(hour=7, minute=0),
+        days=(0, 1, 2, 3, 4, 5, 6),
+        name="daily_news",
+        job_kwargs={'timezone': ist}
+    )
+    
+    logger.info("Daily news scheduled for 7:00 AM IST (auto-sends to all groups)")
 
 def main():
     """Start the bot"""
-    logger.info("Starting Smooth Bot...")
+    logger.info("Starting Smooth Bot with Auto-Group Detection...")
     
     # Validate required environment variables
     if not TELEGRAM_TOKEN:
@@ -286,8 +351,7 @@ def main():
         logger.error("OPENROUTER_API_KEY not set!")
         return
     if not NEWS_API_KEY:
-        logger.error("NEWS_API_KEY not set!")
-        return
+        logger.warning("NEWS_API_KEY not set! News feature will not work.")
     
     # Start Flask server in background
     flask_thread = Thread(target=run_flask, daemon=True)
@@ -297,17 +361,26 @@ def main():
     # Create application
     application = Application.builder().token(TELEGRAM_TOKEN).build()
     
-    # Add message handler
+    # Add handlers
     application.add_handler(MessageHandler(
         filters.TEXT | filters.PHOTO | filters.CAPTION,
         handle_message
     ))
+    application.add_handler(CommandHandler("groups", cmd_groups))
     
-    # Setup daily news
+    # Setup daily news scheduler
     setup_daily_news(application)
     
+    # Load existing groups
+    groups = load_groups()
+    logger.info(f"Loaded {len(groups)} registered groups")
+    
     # Start bot
-    logger.info("Bot is now running! Waiting for messages...")
+    logger.info("Bot is now running! Features:")
+    logger.info("✅ Responds to 'smooth' mentions")
+    logger.info("✅ On-demand news (ask 'smooth news')")
+    logger.info("✅ Auto daily news at 7 AM IST to all groups")
+    logger.info("✅ Auto-detects and remembers groups")
     application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 if __name__ == '__main__':
